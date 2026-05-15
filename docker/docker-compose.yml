@@ -1,0 +1,15 @@
+services:
+  side-stream:
+    image: ghcr.io/1305a001-ctrl/side-stream:latest
+    container_name: side-stream
+    restart: unless-stopped
+    env_file:
+      - /srv/secrets/side-stream.env
+    ports:
+      - "127.0.0.1:8020:8020"
+    networks:
+      - infra-net
+
+networks:
+  infra-net:
+    external: true
