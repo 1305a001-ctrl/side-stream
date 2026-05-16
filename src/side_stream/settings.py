@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     # corresponding strategy-runners config update.
     chainlink_eval_log_stream: str = "chainlink:eval_log"
     tokenized_equity_eval_log_stream: str = "tokenized_equity:eval_log"
+    gmx_execution_paper_log_stream: str = "gmx:execution:paper_log"
 
     # Chainlink reports — per-asset key pattern: chainlink:<alias>:reports
     chainlink_report_stream_pattern: str = "chainlink:{alias}:reports"
@@ -49,6 +50,15 @@ class Settings(BaseSettings):
     # Signal Pro: gating
     signal_pro_min_confidence: float = 0.7    # only broadcast >0.7 confidence
     signal_pro_min_edge_pp: float = 0.03      # only broadcast >3pp edge
+
+    # Signal Pro+ tier: GMX liquidation alerts. Only broadcast paper-log
+    # entries with expected net PnL >= this gate AND distance_to_liq <=
+    # this many percentage points below zero (i.e., already underwater).
+    # The Pro+ value proposition is "the WHALES that are about to be
+    # liquidated" — not noise. Defaults derived from the gmx-strategies
+    # `execution_min_net_profit_usd` so this matches the producer.
+    gmx_alerts_min_net_pnl_usd: float = 500.0
+    gmx_alerts_min_size_usd: float = 50_000.0
 
     # ─── Trigger engine ────────────────────────────────────────────────
     # Re-load active triggers from Postgres every N seconds.

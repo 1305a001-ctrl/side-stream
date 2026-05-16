@@ -100,6 +100,77 @@ def format_signal_message(
     )
 
 
+def parse_gmx_execution(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Pure: validate + normalize a gmx:execution:paper_log entry.
+
+    The producer (gmx-strategies/liquidation_watcher) writes Redis
+    stream fields directly (no JSON wrapper), so payload is the field
+    dict as-decoded by redis-py. All numeric fields are stringified
+    by the producer; coerce here.
+
+    Returns dict with keys: user, market, is_long, size_usd, collateral_usd,
+    distance_to_liq_pct, expected_net_pnl_usd, confidence, ts_unix.
+    None for malformed entries.
+    """
+    if not isinstance(payload, dict):
+        return None
+    user = payload.get("user")
+    market = payload.get("market")
+    if not isinstance(user, str) or not isinstance(market, str):
+        return None
+    try:
+        return {
+            "user": user,
+            "market": market,
+            "is_long": str(payload.get("is_long", "0")) == "1",
+            "size_usd": float(payload.get("size_usd") or 0.0),
+            "collateral_usd": float(payload.get("collateral_usd") or 0.0),
+            "distance_to_liq_pct": float(payload.get("distance_to_liq_pct") or 0.0),
+            "expected_net_pnl_usd": float(payload.get("expected_net_pnl_usd") or 0.0),
+            "confidence": float(payload.get("confidence") or 0.0),
+            "ts_unix": float(payload.get("ts_unix") or 0.0),
+        }
+    except (TypeError, ValueError):
+        return None
+
+
+def format_gmx_alert(norm: dict[str, Any], *, brand_name: str) -> str:
+    """Pure: Markdown-formatted GMX liquidation alert for Signal Pro+ TG.
+
+    Pro+ only — these alerts have real on-chain immediacy (the position
+    is already underwater; a keeper is about to fire). Free + Pro tiers
+    don't get them.
+    """
+    side = "LONG" if norm["is_long"] else "SHORT"
+    user_short = f"{norm['user'][:6]}…{norm['user'][-4:]}"
+    return (
+        f"🐋 *{brand_name} GMX Alert*\n"
+        f"Whale: `{user_short}` {side} *{norm['market'].upper()}*\n"
+        f"Size: *${norm['size_usd']:,.0f}* on ${norm['collateral_usd']:,.0f} collateral\n"
+        f"Distance to liq: *{norm['distance_to_liq_pct']:+.2f}pp* "
+        f"(already underwater = negative)\n"
+        f"Expected keeper PnL: *${norm['expected_net_pnl_usd']:,.0f}* "
+        f"(conf {norm['confidence']:.2f})\n"
+        f"_Eval at: "
+        f"{datetime.fromtimestamp(norm['ts_unix'], UTC).isoformat() if norm['ts_unix'] else '?'}_"
+    )
+
+
+def passes_gmx_alert_gate(
+    norm: dict[str, Any], *, min_net_pnl_usd: float, min_size_usd: float,
+) -> bool:
+    """Pure: should this GMX paper-execution be broadcast to Pro+ subs?
+
+    Two-gate filter:
+      1. expected_net_pnl_usd >= min — keeper would actually take it
+      2. size_usd >= min — whale-scale only; small accounts don't matter
+         to subscribers
+    """
+    if norm.get("expected_net_pnl_usd", 0.0) < min_net_pnl_usd:
+        return False
+    return norm.get("size_usd", 0.0) >= min_size_usd
+
+
 def select_free_top_n(
     buffer: list[dict[str, Any]], *, top_n: int,
 ) -> list[dict[str, Any]]:
@@ -316,22 +387,115 @@ async def _flush_free_top_n(
         )
 
 
+async def _consume_gmx_paper_log(
+    redis_client: redis_async.Redis,
+    pool: asyncpg.Pool,
+    http: httpx.AsyncClient,
+    *,
+    stop: asyncio.Event,
+) -> None:
+    """Forever loop: XREAD gmx:execution:paper_log → broadcast qualifying
+    whale liquidations to the Pro+ Telegram group.
+
+    Pro+ only — these are real on-chain whale liquidations, not free or
+    Pro-tier general signals. Gate is min_net_pnl + min_size.
+    """
+    cursor = "$"  # start from now; ignore backlog
+    while not stop.is_set():
+        try:
+            result = await redis_client.xread(
+                {settings.gmx_execution_paper_log_stream: cursor},
+                block=5_000, count=200,
+            )
+        except Exception:
+            log.exception("signal_pusher.gmx_xread_failed")
+            await asyncio.sleep(2)
+            continue
+
+        if not result:
+            continue
+
+        for _stream, entries in result:
+            for entry_id, fields in entries:
+                cursor = entry_id
+                # GMX paper_log uses Redis stream fields directly (no JSON
+                # wrapper) — `fields` IS the dict.
+                norm = parse_gmx_execution(fields)
+                if norm is None:
+                    continue
+                if not passes_gmx_alert_gate(
+                    norm,
+                    min_net_pnl_usd=settings.gmx_alerts_min_net_pnl_usd,
+                    min_size_usd=settings.gmx_alerts_min_size_usd,
+                ):
+                    continue
+                await _try_gmx_pro_plus_broadcast(
+                    norm, signal_id=entry_id, pool=pool, http=http,
+                )
+    log.info("signal_pusher.gmx_loop_stopped")
+
+
+async def _try_gmx_pro_plus_broadcast(
+    norm: dict[str, Any], *, signal_id: str, pool: asyncpg.Pool,
+    http: httpx.AsyncClient,
+) -> None:
+    """Broadcast a GMX whale-liq alert to the Pro+ TG group. Idempotent."""
+    text = format_gmx_alert(norm, brand_name=settings.brand_name)
+    if settings.telegram_mock_mode:
+        log.info(
+            "signal_pusher.gmx_mock_broadcast signal_id=%s text=%r",
+            signal_id, text[:200],
+        )
+        delivered, err = True, None
+    else:
+        # Pro+ alerts go to the same Pro group for now — when there's a
+        # dedicated Pro+ chat, point at it instead. The broadcast_logs
+        # channel field differentiates ('pro_plus_telegram').
+        delivered, err = await _broadcast_telegram(
+            bot_token=settings.telegram_bot_token,
+            chat_id=settings.telegram_pro_group_id,
+            text=text,
+            http=http,
+        )
+    await _record_broadcast(
+        pool,
+        signal_source="gmx_liquidation",
+        signal_id=signal_id,
+        channel="pro_plus_telegram",
+        delivered=delivered,
+        error=err,
+        payload=norm,
+    )
+
+
 async def run(stop: asyncio.Event) -> None:
-    """Top-level entry point for the signal_pusher service."""
+    """Top-level entry point for the signal_pusher service.
+
+    Spawns one consumer per upstream Redis stream; they run concurrently
+    and share the asyncpg pool + httpx client.
+    """
     log.info(
-        "signal_pusher.starting mock=%s free_top_n=%d free_delay=%ds pro_min_edge=%.3fpp",
+        "signal_pusher.starting mock=%s free_top_n=%d free_delay=%ds "
+        "pro_min_edge=%.3fpp gmx_min_pnl=$%.0f gmx_min_size=$%.0f",
         settings.telegram_mock_mode,
         settings.free_top_n_per_day,
         settings.free_delay_seconds,
         settings.signal_pro_min_edge_pp,
+        settings.gmx_alerts_min_net_pnl_usd,
+        settings.gmx_alerts_min_size_usd,
     )
 
     pool = await asyncpg.create_pool(settings.postgres_dsn, min_size=1, max_size=5)
     redis_client = redis_async.from_url(settings.redis_url, decode_responses=True)
     async with httpx.AsyncClient() as http:
         try:
-            await _consume_chainlink_eval_log(
-                redis_client, pool, http, stop=stop,
+            await asyncio.gather(
+                _consume_chainlink_eval_log(
+                    redis_client, pool, http, stop=stop,
+                ),
+                _consume_gmx_paper_log(
+                    redis_client, pool, http, stop=stop,
+                ),
             )
         finally:
             await redis_client.aclose()
@@ -340,8 +504,11 @@ async def run(stop: asyncio.Event) -> None:
 
 
 __all__ = [
+    "format_gmx_alert",
     "format_signal_message",
     "parse_chainlink_eval",
+    "parse_gmx_execution",
+    "passes_gmx_alert_gate",
     "run",
     "select_free_top_n",
 ]
