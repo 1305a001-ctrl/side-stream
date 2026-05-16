@@ -85,12 +85,22 @@ class Settings(BaseSettings):
     # 'whop' | 'stripe' | 'none' (in-memory entitlements for dev/test)
     payment_mode: str = "none"
     whop_api_key: str = ""
+    whop_webhook_secret: str = ""    # for X-Whop-Signature HMAC verification
     whop_signal_pro_product_id: str = ""
     whop_pro_alerts_product_id: str = ""
     whop_signal_pro_plus_product_id: str = ""
     whop_enterprise_product_id: str = ""
     stripe_api_key: str = ""
     stripe_webhook_secret: str = ""
+    # Stripe price_id → tier map. Operator sets one entry per active
+    # price in their Stripe account. Example value:
+    #   "price_1Abc...=pro_alerts,price_2Def...=signal_pro"
+    stripe_price_tier_map_csv: str = ""
+
+    # ─── Admin endpoints ───────────────────────────────────────────────
+    # Bearer token required on /v1/admin/* routes. Empty = admin routes
+    # refuse all requests (default-deny).
+    admin_bearer_token: str = ""
 
     # ─── HTTP server ───────────────────────────────────────────────────
     http_host: str = "0.0.0.0"  # noqa: S104 — bound to 127.0.0.1 in compose
