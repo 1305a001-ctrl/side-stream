@@ -107,5 +107,12 @@ class Settings(BaseSettings):
     http_port: int = 8020       # outside existing port range (8000-8013)
     log_level: str = "INFO"
 
+    # ─── Local LLM enrichment (optional) ───────────────────────────────
+    # When set, signal broadcasts include a directional sentiment tag
+    # fetched from the local-llm service (running on ai-edge / ai-staging).
+    # Empty = enrichment disabled (broadcasts ship unchanged).
+    local_llm_base_url: str = ""
+    local_llm_timeout_sec: float = 5.0
+
 
 settings = Settings()  # type: ignore[call-arg]

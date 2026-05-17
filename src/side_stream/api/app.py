@@ -102,6 +102,18 @@ app = FastAPI(
 )
 
 
+# ─── Landing + dashboard + analytics (router includes) ──────────────────
+
+
+from side_stream.api import analytics as _analytics_routes  # noqa: E402
+from side_stream.api import dashboard as _dashboard_routes  # noqa: E402
+from side_stream.api import landing as _landing_routes  # noqa: E402
+
+app.include_router(_landing_routes.router)
+app.include_router(_dashboard_routes.router)
+app.include_router(_analytics_routes.router)
+
+
 # ─── Health ────────────────────────────────────────────────────────────
 
 
