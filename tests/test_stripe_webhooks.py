@@ -177,16 +177,16 @@ def test_handled_event_types_complete():
 
 
 def test_price_to_tier_lookup():
-    m = {"price_1Pro": "pro_alerts", "price_2Plus": "signal_pro_plus"}
-    assert stripe_price_to_tier(price_id="price_1Pro", price_tier_map=m) == "pro_alerts"
+    m = {"price_1Std": "standard", "price_2Pro": "pro"}
+    assert stripe_price_to_tier(price_id="price_1Std", price_tier_map=m) == "standard"
     assert (
-        stripe_price_to_tier(price_id="price_2Plus", price_tier_map=m)
-        == "signal_pro_plus"
+        stripe_price_to_tier(price_id="price_2Pro", price_tier_map=m)
+        == "pro"
     )
 
 
 def test_price_to_tier_unknown_returns_none():
-    m = {"price_1Pro": "pro_alerts"}
+    m = {"price_1Std": "standard"}
     assert stripe_price_to_tier(price_id="price_unknown", price_tier_map=m) is None
 
 

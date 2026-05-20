@@ -86,16 +86,52 @@ class Settings(BaseSettings):
     payment_mode: str = "none"
     whop_api_key: str = ""
     whop_webhook_secret: str = ""    # for X-Whop-Signature HMAC verification
-    whop_signal_pro_product_id: str = ""
-    whop_pro_alerts_product_id: str = ""
-    whop_signal_pro_plus_product_id: str = ""
-    whop_enterprise_product_id: str = ""
+    # 3-SKU model (Free / $49 Standard / $99 Pro) — eval doc 2026-05-20:
+    # >3 tiers drops Whop conversion 15-20%. Founding $29 is a price SKU
+    # within 'standard' (capped at 50 lifetime per kill-list rule 4), not
+    # a separate tier — both founding + standard product IDs map to
+    # tier='standard'.
+    whop_founding_product_id: str = ""   # $29/mo, capped at 50 lifetime
+    whop_standard_product_id: str = ""   # $49/mo
+    whop_pro_product_id: str = ""        # $99/mo
     stripe_api_key: str = ""
     stripe_webhook_secret: str = ""
     # Stripe price_id → tier map. Operator sets one entry per active
     # price in their Stripe account. Example value:
-    #   "price_1Abc...=pro_alerts,price_2Def...=signal_pro"
+    #   "price_1Abc...=standard,price_2Def...=pro"
     stripe_price_tier_map_csv: str = ""
+
+    # ─── LLM validation (A5 — eval doc 2026-05-20 D5) ──────────────────
+    # ai-edge local-llm v0.1 is LIVE on :8030 with /validate-signal endpoint.
+    # When enabled, every Pro-tier broadcast is gated through it; the LLM
+    # vetoes 'impossible_price' / 'stale_price' / 'looks_real=False'.
+    local_llm_base_url: str = "http://ai-edge:8030"
+    local_llm_timeout_sec: float = 8.0
+    llm_validation_enabled: bool = False  # flip on once ai-edge link verified
+    # CSV of risk_tag values that cause rejection. Empty → DEFAULT_REJECT_TAGS.
+    llm_validation_reject_tags_csv: str = "impossible_price,stale_price"
+
+    # ─── Quality snapshot (A4 — eval doc 2026-05-20 D1+D4) ─────────────
+    # Tracked strategy slugs (CSV). signal_pusher's writer_loop computes
+    # a 30d snapshot per slug every quality_snapshot_interval_sec and
+    # writes to ``publishing:quality:<slug>`` with EXPIRE.
+    quality_tracked_slugs: str = "chainlink_lag"
+    quality_window_days: int = 30
+    quality_snapshot_interval_sec: int = 60
+    quality_snapshot_ttl_sec: int = 180   # 3× interval — deadman if writer dies
+    quality_min_sharpe: float = 1.0       # gate floor — below = no broadcast
+    quality_min_n_closed: int = 30        # gate floor — too few closes = no broadcast
+    # If True, missing snapshot blocks publish (fail-CLOSED — brand promise).
+    # If False, missing snapshot allows publish with footer absent (fail-OPEN).
+    # Start False for soft-launch; flip True for public launch.
+    quality_snapshot_required: bool = False
+
+    # ─── Observability (A7 — eval doc 2026-05-20) ──────────────────────
+    # Sentry free tier (5k events/mo) covers a 100-sub product. Operator
+    # pastes DSN to enable; empty = silent no-op.
+    sentry_dsn: str = ""
+    sentry_environment: str = "production"
+    sentry_traces_sample_rate: float = 0.1
 
     # ─── Admin endpoints ───────────────────────────────────────────────
     # Bearer token required on /v1/admin/* routes. Empty = admin routes

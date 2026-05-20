@@ -25,7 +25,9 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     tier            TEXT NOT NULL CHECK (
-        tier IN ('free', 'pro_alerts', 'signal_pro', 'signal_pro_plus', 'enterprise')
+        -- 3-SKU model (eval doc 2026-05-20 prune): free / standard / pro.
+        -- Founding ($29) and Standard ($49) both write tier='standard'.
+        tier IN ('free', 'standard', 'pro')
     ),
     status          TEXT NOT NULL DEFAULT 'active'
                     CHECK (status IN ('active', 'past_due', 'canceled', 'expired')),

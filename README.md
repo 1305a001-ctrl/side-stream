@@ -11,15 +11,15 @@ Two product surfaces on one backend:
 
 Shared Postgres for users + subscriptions + trigger rules + delivery logs. Shared Redis as the price source (chainlink:&lt;alias&gt;:reports streams from chainlink-streams Go service).
 
-## SKUs
+## SKUs (3-tier post 2026-05-20 eval prune)
 
 | Tier | Price | Includes |
 |---|---|---|
 | Free | $0 | Public TG channel, 5-min delay, top 3 signals/day |
-| Pro Alerts | $9/mo | Unlimited custom price-cross triggers (webhook/Discord/Slack/email), sub-second |
-| Signal Pro | $39/mo | Private TG group with real-time signals + Pro Alerts bundled |
-| Signal Pro+ | $99/mo | Signal Pro + GMX liquidation alerts + news-driven Polymarket triggers |
-| Enterprise | $299/mo | Signal Pro+ + REST API + white-label rights |
+| Standard | $49/mo (or $29 founding × 50 lifetime cap) | Private TG real-time signals + 100 custom price-cross triggers (webhook/Discord/Slack/email) + sub-second alerts |
+| Pro | $99/mo | Standard + 500 triggers + GMX liquidation alerts + news-driven Polymarket triggers + weekly Sunday write-up |
+
+5-tier model archived 2026-05-20 — eval doc found >3 tiers drops Whop conversion 15-20%. Founding $29 is a price SKU within 'standard', not a separate tier; capped at 50 lifetime then closed permanently (kill-list rule 4).
 
 ## Repo layout
 
@@ -81,11 +81,10 @@ python -m side_stream.main
    - Set `TELEGRAM_MOCK_MODE=false` once configured (default true = stdout logging only)
 
 4. **Pick payment provider**:
-   - **Whop (recommended)** — create products at whop.com, paste product IDs:
-     - `WHOP_PRO_ALERTS_PRODUCT_ID=...`
-     - `WHOP_SIGNAL_PRO_PRODUCT_ID=...`
-     - `WHOP_SIGNAL_PRO_PLUS_PRODUCT_ID=...`
-     - `WHOP_ENTERPRISE_PRODUCT_ID=...`
+   - **Whop (recommended)** — create 3 products at whop.com, paste product IDs:
+     - `WHOP_FOUNDING_PRODUCT_ID=...`  ($29/mo, capped at 50 lifetime, then close permanently)
+     - `WHOP_STANDARD_PRODUCT_ID=...`  ($49/mo)
+     - `WHOP_PRO_PRODUCT_ID=...`       ($99/mo)
      - Set `PAYMENT_MODE=whop`
      - Configure Whop webhook → `https://api.<your-domain>/v1/webhooks/whop`
    - **Stripe (alternative)** — set `PAYMENT_MODE=stripe` + Stripe creds + connect to existing Stripe products

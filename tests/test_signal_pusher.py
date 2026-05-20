@@ -6,13 +6,20 @@ import os
 os.environ.setdefault("POSTGRES_DSN", "postgresql://test:test@localhost:5432/test")
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/0")
 
+from unittest.mock import AsyncMock
+
+import pytest
+
 from side_stream.signal_pusher import (
     format_gmx_alert,
     format_signal_message,
+    is_emitted_signal,
+    is_source_halted,
     parse_chainlink_eval,
     parse_gmx_execution,
     passes_gmx_alert_gate,
     select_free_top_n,
+    source_to_strategy_slug,
 )
 
 
@@ -210,3 +217,106 @@ def test_format_gmx_alert_short_position_marked():
     msg = format_gmx_alert(norm, brand_name="Streams Edge")
     assert "SHORT" in msg
     assert "LONG" not in msg
+
+
+# ─── A1 — halt-aware broadcast (eval doc 2026-05-20) ───────────────────
+
+
+def test_source_to_strategy_slug_chainlink_passthrough():
+    """chainlink_lag broadcast source uses the same strategy slug."""
+    assert source_to_strategy_slug("chainlink_lag") == "chainlink_lag"
+
+
+def test_source_to_strategy_slug_gmx_maps_to_liquidator():
+    """GMX broadcast 'gmx_liquidation' maps to upstream strategy
+    'gmx_liquidator' — the strategy:halts set uses the latter name."""
+    assert source_to_strategy_slug("gmx_liquidation") == "gmx_liquidator"
+
+
+def test_source_to_strategy_slug_unknown_passes_through():
+    """Unknown sources fall through to their own name — defensive default
+    so a typo doesn't silently break halt-checking."""
+    assert source_to_strategy_slug("future_source") == "future_source"
+
+
+def _make_fake_redis(*, strategy: set[str], publishing: set[str]) -> AsyncMock:
+    """Build an AsyncMock with a sismember that reads from the given sets."""
+    fake = AsyncMock()
+
+    async def sismember(key: str, member: str) -> int:
+        if key == "strategy:halts":
+            return 1 if member in strategy else 0
+        if key == "publishing:halts":
+            return 1 if member in publishing else 0
+        return 0
+
+    fake.sismember = sismember
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_is_source_halted_returns_false_when_no_halts():
+    fake = _make_fake_redis(strategy=set(), publishing=set())
+    assert await is_source_halted(fake, source="chainlink_lag") is False
+
+
+@pytest.mark.asyncio
+async def test_is_source_halted_when_strategy_halted():
+    """Trading-side halt for the strategy cascades to publishing — the
+    brand-decay guard. If we're not trading it, we don't broadcast it."""
+    fake = _make_fake_redis(strategy={"chainlink_lag"}, publishing=set())
+    assert await is_source_halted(fake, source="chainlink_lag") is True
+
+
+@pytest.mark.asyncio
+async def test_is_source_halted_when_strategy_halted_gmx_slug_mapped():
+    """GMX broadcast source must check against 'gmx_liquidator' (slug),
+    not 'gmx_liquidation' (broadcast label)."""
+    fake = _make_fake_redis(strategy={"gmx_liquidator"}, publishing=set())
+    assert await is_source_halted(fake, source="gmx_liquidation") is True
+
+
+@pytest.mark.asyncio
+async def test_is_source_halted_when_publishing_paused_for_source():
+    """Operator paused this specific source via /v1/admin/pause."""
+    fake = _make_fake_redis(strategy=set(), publishing={"chainlink_lag"})
+    assert await is_source_halted(fake, source="chainlink_lag") is True
+
+
+@pytest.mark.asyncio
+async def test_is_source_halted_when_publishing_paused_all():
+    """Blanket 'all' pause halts every source — used for maintenance windows."""
+    fake = _make_fake_redis(strategy=set(), publishing={"all"})
+    assert await is_source_halted(fake, source="chainlink_lag") is True
+    assert await is_source_halted(fake, source="gmx_liquidation") is True
+
+
+@pytest.mark.asyncio
+async def test_is_source_halted_fails_open_on_redis_error():
+    """Redis hiccup must NOT silently freeze all publishing. A1 fails OPEN
+    on transient errors — the Sharpe-gate (A4, separate) enforces the
+    quality-based pause; A1 is only operator + upstream-cascade halt."""
+    fake = AsyncMock()
+    fake.sismember = AsyncMock(side_effect=ConnectionError("redis down"))
+    assert await is_source_halted(fake, source="chainlink_lag") is False
+
+
+# ─── A8 — eat-own-dogfood gate (eval doc kill-list rule 5) ─────────────
+
+
+def test_is_emitted_signal_accepts_emitted():
+    """Only 'emitted' = strategy actually sent to OMS = we trade it."""
+    assert is_emitted_signal({"decision": "emitted"}) is True
+
+
+def test_is_emitted_signal_rejects_would_emit():
+    """'would_emit' = candidate, blocked by some other gate — Pro subs
+    pay for what we trade, not what we considered."""
+    assert is_emitted_signal({"decision": "would_emit"}) is False
+
+
+def test_is_emitted_signal_rejects_unknown_decision():
+    """Defensive: unknown decision values block (safer than allowing)."""
+    assert is_emitted_signal({"decision": "skipped"}) is False
+    assert is_emitted_signal({}) is False
+    assert is_emitted_signal({"decision": None}) is False

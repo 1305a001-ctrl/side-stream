@@ -7,9 +7,11 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import asyncpg
+import redis.asyncio as redis_async
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, EmailStr, Field, field_validator
 
+from side_stream import observability
 from side_stream.settings import settings
 from side_stream.stripe_webhooks import (
     normalize_stripe_event,
@@ -85,12 +87,25 @@ class WhopWebhookEvent(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     log.info("api.starting payment_mode=%s", settings.payment_mode)
+    # A7 — Sentry init. No-op when DSN empty (dev/test) or sentry-sdk absent.
+    observability.init_sentry(
+        dsn=settings.sentry_dsn,
+        environment=settings.sentry_environment,
+        traces_sample_rate=settings.sentry_traces_sample_rate,
+        component="side-stream-api",
+    )
     app.state.pg_pool = await asyncpg.create_pool(
         settings.postgres_dsn, min_size=1, max_size=5,
+    )
+    # Redis client used by /v1/admin/pause + /v1/admin/resume to flip
+    # publishing:halts membership. signal_pusher reads the same set.
+    app.state.redis_client = redis_async.from_url(
+        settings.redis_url, decode_responses=True,
     )
     try:
         yield
     finally:
+        await app.state.redis_client.aclose()
         await app.state.pg_pool.close()
         log.info("api.stopped")
 
@@ -119,13 +134,14 @@ async def health() -> dict[str, Any]:
 
 
 def _tier_to_max_triggers(tier: str | None) -> int:
-    """Per-tier ceiling on active triggers per user."""
+    """Per-tier ceiling on active triggers per user.
+
+    3-SKU model post 2026-05-20 eval-doc prune (was 5 tiers).
+    """
     return {
-        "free": 0,                # Free tier doesn't get custom triggers
-        "pro_alerts": 100,
-        "signal_pro": 100,        # bundled
-        "signal_pro_plus": 500,
-        "enterprise": 5_000,
+        "free": 0,           # Free tier: TG only, no custom triggers
+        "standard": 100,     # $29 founding / $49 standard
+        "pro": 500,          # $99 — bundles GMX liq alerts + news triggers
     }.get(tier or "", 0)
 
 
@@ -149,10 +165,8 @@ async def _get_active_tier(pool: asyncpg.Pool, user_id: str) -> str | None:
             """SELECT tier FROM subscriptions
                WHERE user_id = $1 AND status = 'active'
                ORDER BY CASE tier
-                  WHEN 'enterprise' THEN 5
-                  WHEN 'signal_pro_plus' THEN 4
-                  WHEN 'signal_pro' THEN 3
-                  WHEN 'pro_alerts' THEN 2
+                  WHEN 'pro' THEN 3
+                  WHEN 'standard' THEN 2
                   WHEN 'free' THEN 1
                   ELSE 0 END DESC
                LIMIT 1""",
@@ -278,17 +292,20 @@ _WHOP_PRODUCT_TIER_MAP: dict[str, str] = {}
 
 
 def _refresh_whop_map() -> None:
-    """Build the product_id → tier lookup from settings."""
+    """Build the product_id → tier lookup from settings.
+
+    3-SKU model. Founding ($29) + Standard ($49) both map to tier='standard'
+    — same access, different price. Founding is a launch-only urgency SKU
+    capped at 50 lifetime (kill-list rule 4, eval doc 2026-05-20).
+    """
     global _WHOP_PRODUCT_TIER_MAP
     _WHOP_PRODUCT_TIER_MAP = {}
-    if settings.whop_pro_alerts_product_id:
-        _WHOP_PRODUCT_TIER_MAP[settings.whop_pro_alerts_product_id] = "pro_alerts"
-    if settings.whop_signal_pro_product_id:
-        _WHOP_PRODUCT_TIER_MAP[settings.whop_signal_pro_product_id] = "signal_pro"
-    if settings.whop_signal_pro_plus_product_id:
-        _WHOP_PRODUCT_TIER_MAP[settings.whop_signal_pro_plus_product_id] = "signal_pro_plus"
-    if settings.whop_enterprise_product_id:
-        _WHOP_PRODUCT_TIER_MAP[settings.whop_enterprise_product_id] = "enterprise"
+    if settings.whop_founding_product_id:
+        _WHOP_PRODUCT_TIER_MAP[settings.whop_founding_product_id] = "standard"
+    if settings.whop_standard_product_id:
+        _WHOP_PRODUCT_TIER_MAP[settings.whop_standard_product_id] = "standard"
+    if settings.whop_pro_product_id:
+        _WHOP_PRODUCT_TIER_MAP[settings.whop_pro_product_id] = "pro"
 
 
 _refresh_whop_map()
@@ -375,7 +392,7 @@ async def whop_webhook(
 def _stripe_price_tier_map_from_settings() -> dict[str, str]:
     """Parse settings.stripe_price_tier_map_csv → dict[price_id, tier].
 
-    Format: "price_1Abc=pro_alerts,price_2Def=signal_pro"
+    Format: "price_1Abc=standard,price_2Def=pro"
     """
     out: dict[str, str] = {}
     raw = settings.stripe_price_tier_map_csv or ""
@@ -504,10 +521,13 @@ async def admin_summary(
             """SELECT COUNT(*) FROM broadcast_logs
                WHERE created_at > NOW() - INTERVAL '24 hours'""",
         )
-    # Compute MRR estimate from active subs
+    # Compute MRR estimate from active subs.
+    # 3-SKU model. Founding $29 cohort (capped at 50) is undercounted here
+    # by $20 × n_founding/mo — acceptable rough estimate; precise MRR
+    # would require storing price_paid on the subscription row.
     tier_prices = {
-        "pro_alerts": 9.0, "signal_pro": 39.0,
-        "signal_pro_plus": 99.0, "enterprise": 299.0,
+        "standard": 49.0,
+        "pro": 99.0,
     }
     mrr = 0.0
     by_tier_status: dict[str, dict[str, int]] = {}
@@ -545,10 +565,8 @@ async def admin_list_users(
                      SELECT s.tier FROM subscriptions s
                      WHERE s.user_id = u.id AND s.status = 'active'
                      ORDER BY CASE s.tier
-                       WHEN 'enterprise' THEN 5
-                       WHEN 'signal_pro_plus' THEN 4
-                       WHEN 'signal_pro' THEN 3
-                       WHEN 'pro_alerts' THEN 2
+                       WHEN 'pro' THEN 3
+                       WHEN 'standard' THEN 2
                        WHEN 'free' THEN 1
                        ELSE 0 END DESC
                      LIMIT 1
@@ -599,6 +617,92 @@ async def admin_recent_broadcasts(
         }
         for r in rows
     ]
+
+
+# ─── Publishing halt control (A1 — eval doc 2026-05-20) ────────────────
+
+
+VALID_PAUSE_SOURCES: set[str] = {"chainlink_lag", "gmx_liquidation", "all"}
+
+
+@app.post("/v1/admin/pause")
+async def admin_pause_publishing(
+    http_req: Request,
+    source: str = "all",
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    """Operator pause — SADD into publishing:halts. Stops signal_pusher
+    broadcasting for the given source (or 'all').
+
+    Independent of strategy:halts (which cascades from trading-side halts).
+    Either set membership halts broadcasts; this gives operators a
+    publishing-only override without touching the trading book.
+    """
+    _require_admin(authorization)
+    if source not in VALID_PAUSE_SOURCES:
+        raise HTTPException(
+            400,
+            f"source must be one of {sorted(VALID_PAUSE_SOURCES)}",
+        )
+    redis_client = http_req.app.state.redis_client
+    await redis_client.sadd("publishing:halts", source)
+    log.warning("admin.publishing_paused source=%s", source)
+    return {"status": "paused", "source": source}
+
+
+@app.post("/v1/admin/resume")
+async def admin_resume_publishing(
+    http_req: Request,
+    source: str = "all",
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    """Operator resume — SREM from publishing:halts. Re-enables broadcasts.
+
+    Does NOT clear strategy:halts (those are managed by the trading
+    halt path — the right way to resume a trading-halted strategy is
+    via that strategy's own resume procedure).
+    """
+    _require_admin(authorization)
+    if source not in VALID_PAUSE_SOURCES:
+        raise HTTPException(
+            400,
+            f"source must be one of {sorted(VALID_PAUSE_SOURCES)}",
+        )
+    redis_client = http_req.app.state.redis_client
+    removed = await redis_client.srem("publishing:halts", source)
+    log.warning("admin.publishing_resumed source=%s removed=%d", source, removed)
+    return {"status": "resumed", "source": source, "was_paused": bool(removed)}
+
+
+@app.get("/v1/admin/publishing-status")
+async def admin_publishing_status(
+    http_req: Request,
+    authorization: str = Header(default=""),
+) -> dict[str, Any]:
+    """Inspect current halt state across both halt layers.
+
+    Returns both publishing:halts (operator-controlled) and strategy:halts
+    (trading-cascade) so an operator can see "why isn't it publishing"
+    at a glance.
+    """
+    _require_admin(authorization)
+    redis_client = http_req.app.state.redis_client
+    publishing = set(await redis_client.smembers("publishing:halts"))
+    strategy = set(await redis_client.smembers("strategy:halts"))
+    # Map broadcast 'source' → upstream strategy slug for the blocked-for view
+    src_to_slug = {
+        "chainlink_lag": "chainlink_lag",
+        "gmx_liquidation": "gmx_liquidator",
+    }
+    blocked = [
+        source for source, slug in src_to_slug.items()
+        if "all" in publishing or source in publishing or slug in strategy
+    ]
+    return {
+        "publishing_halts": sorted(publishing),
+        "strategy_halts": sorted(strategy),
+        "broadcasts_currently_blocked_for": blocked,
+    }
 
 
 __all__ = ["app"]

@@ -3,7 +3,7 @@
 Both providers send a header containing a signature derived from the
 shared webhook secret + request body. Forgery is trivial without
 verification — anyone could POST to /v1/webhooks/whop and upgrade
-themselves to enterprise tier. These helpers gate the webhook routes
+themselves to pro tier. These helpers gate the webhook routes
 so only the real provider's payloads are honored.
 
 Whop:

@@ -25,6 +25,7 @@ import asyncpg
 import httpx
 import redis.asyncio as redis_async
 
+from side_stream import llm_validator, observability, quality_snapshot
 from side_stream.settings import settings
 
 log = logging.getLogger(__name__)
@@ -71,33 +72,52 @@ def parse_chainlink_eval(payload: dict[str, Any]) -> dict[str, Any] | None:
 
 def format_signal_message(
     norm: dict[str, Any], *, brand_name: str, is_pro: bool,
+    quality_snapshot: dict[str, Any] | None = None,
 ) -> str:
     """Pure: build the Markdown-formatted TG message for one signal.
 
     Free version is intentionally less detailed than Pro (gives subs a
     reason to upgrade).
+
+    Pro version appends a quality footer when a snapshot is provided —
+    the eval-doc transparency differentiator (D4). Free tier never gets
+    the footer.
     """
     slug = norm["slug"]
     direction = (norm.get("direction") or "").upper() or "?"
     edge_pp = norm["edge_pp"]
     cadence = norm["cadence"]
     if is_pro:
-        return (
+        # A6 — premium card polish: direction emoji for instant visual scan.
+        # BUY_YES = green, BUY_NO = red, anything else = neutral.
+        direction_emoji = {
+            "BUY_YES": "🟢", "BUY_NO": "🔴",
+        }.get(direction, "⚪")
+        msg = (
             f"🎯 *{brand_name} Signal*\n"
             f"Market: `{slug}`\n"
-            f"Direction: *{direction}*\n"
+            f"Direction: {direction_emoji} *{direction}*\n"
             f"Cadence: {cadence}\n"
             f"Edge: *{edge_pp:.3f}pp* (fair_yes={norm['fair_yes']:.3f}, "
             f"market_yes={norm['market_yes']:.3f})\n"
             f"Volume24h: ${norm['market_volume_24h']:,.0f}\n"
             f"Eval at: {datetime.fromtimestamp(norm['evaluated_at_unix'], UTC).isoformat()}\n"
         )
-    # Free tier — short + delayed
+        footer = quality_snapshot_format_footer(quality_snapshot)
+        if footer:
+            msg += f"{footer}\n"
+        return msg
+    # Free tier — short + delayed, never carries quality footer
     return (
         f"📡 *{brand_name}*\n"
         f"Signal on `{slug[:50]}…` — direction *{direction}*, "
         f"edge {edge_pp:.2f}pp. _Upgrade for full details._"
     )
+
+
+# Imported as local alias so format_signal_message stays a pure helper
+# (no top-of-module side-effect imports beyond what's already there).
+quality_snapshot_format_footer = quality_snapshot.format_quality_footer
 
 
 def parse_gmx_execution(payload: dict[str, Any]) -> dict[str, Any] | None:
@@ -182,6 +202,35 @@ def select_free_top_n(
     return sorted(buffer, key=lambda s: s.get("edge_pp", 0.0), reverse=True)[:top_n]
 
 
+def source_to_strategy_slug(source: str) -> str:
+    """Pure: map signal_pusher 'source' label → strategy:halts member name.
+
+    Some upstream strategies use a different naming convention than what
+    we label in broadcast_logs. This maps the broadcast 'source' to the
+    actual strategy slug used in the strategy:halts Redis set so we can
+    halt-cascade correctly.
+    """
+    return {
+        "chainlink_lag": "chainlink_lag",
+        "gmx_liquidation": "gmx_liquidator",
+    }.get(source, source)
+
+
+def is_emitted_signal(norm: dict[str, Any]) -> bool:
+    """A8 — dogfood gate (eval doc 2026-05-20 kill-list rule 5).
+
+    Pure: True only when the signal was ACTUALLY emitted by the strategy
+    (i.e., an oms_intent row was created upstream), not a "would_emit"
+    candidate that was blocked by some other gate (cooldown, volume, etc).
+
+    Pro-tier broadcasts use this — subscribers pay for what we trade,
+    not what we considered trading. Free tier still accepts 'would_emit'
+    candidates because the 5-min delay + top-N filter already acts as a
+    quality screen.
+    """
+    return norm.get("decision") == "emitted"
+
+
 # ─── Async I/O ─────────────────────────────────────────────────────────
 
 
@@ -239,6 +288,37 @@ async def _record_broadcast(
             return False
 
 
+async def is_source_halted(
+    redis_client: redis_async.Redis,
+    *,
+    source: str,
+) -> bool:
+    """Halt-gate before any broadcast. Two layers:
+
+      1. ``strategy:halts SISMEMBER <upstream_slug>`` — upstream trading
+         halt cascades to publishing (the brand-decay guard).
+      2. ``publishing:halts SISMEMBER <source>`` — operator pause for
+         this signal source (independent of upstream).
+      3. ``publishing:halts SISMEMBER 'all'`` — blanket operator pause.
+
+    Any membership returns True (halted). Fail-OPEN on Redis errors:
+    a hiccup must not silently freeze all publishing. The Sharpe-based
+    quality gate (A4, separate) is what enforces the brand promise of
+    "we don't publish when it's not working" — A1 is just operator +
+    upstream-cascade halt.
+    """
+    slug = source_to_strategy_slug(source)
+    try:
+        if await redis_client.sismember("strategy:halts", slug):
+            return True
+        if await redis_client.sismember("publishing:halts", source):
+            return True
+        return bool(await redis_client.sismember("publishing:halts", "all"))
+    except Exception:
+        log.exception("signal_pusher.halt_check_failed source=%s", source)
+        return False
+
+
 async def _consume_chainlink_eval_log(
     redis_client: redis_async.Redis,
     pool: asyncpg.Pool,
@@ -292,6 +372,7 @@ async def _consume_chainlink_eval_log(
                         await _try_pro_broadcast(
                             norm, signal_id=entry_id, pool=pool, http=http,
                             source="chainlink_lag",
+                            redis_client=redis_client,
                         )
 
                     # Free buffer — pick top-N later.
@@ -306,6 +387,7 @@ async def _consume_chainlink_eval_log(
                 pool=pool,
                 http=http,
                 source="chainlink_lag",
+                redis_client=redis_client,
             )
 
     log.info("signal_pusher.chainlink_loop_stopped")
@@ -314,10 +396,71 @@ async def _consume_chainlink_eval_log(
 async def _try_pro_broadcast(
     norm: dict[str, Any], *, signal_id: str, pool: asyncpg.Pool,
     http: httpx.AsyncClient, source: str,
+    redis_client: redis_async.Redis,
 ) -> None:
-    """Broadcast one signal to the Pro TG group. Idempotent on signal_id."""
+    """Broadcast one signal to the Pro TG group. Idempotent on signal_id.
+
+    Halt-aware: skips if upstream strategy is halted or operator paused
+    publishing for this source. Halt-skips are NOT recorded to
+    broadcast_logs so a future retry (after halt clears) isn't blocked
+    by the UNIQUE constraint.
+    """
+    if await is_source_halted(redis_client, source=source):
+        log.info(
+            "signal_pusher.pro_skip_halted source=%s signal_id=%s",
+            source, signal_id,
+        )
+        return
+    # A8 — dogfood gate. Pro subs pay to see what we actually trade,
+    # not "would_emit" candidates. Free tier still accepts both.
+    if not is_emitted_signal(norm):
+        log.info(
+            "signal_pusher.pro_skip_not_emitted source=%s signal_id=%s decision=%s",
+            source, signal_id, norm.get("decision"),
+        )
+        return
+    # A4 — calibration-aware publishing. Read the current 30d snapshot
+    # for this source's upstream strategy, gate against it, and pass
+    # the snapshot to the formatter for the transparency footer.
+    slug = source_to_strategy_slug(source)
+    snapshot = await quality_snapshot.read_snapshot(redis_client, slug=slug)
+    allow, reason = quality_snapshot.passes_quality_gate(
+        snapshot,
+        min_sharpe=settings.quality_min_sharpe,
+        min_n_closed=settings.quality_min_n_closed,
+        required=settings.quality_snapshot_required,
+    )
+    if not allow:
+        log.info(
+            "signal_pusher.pro_skip_quality source=%s signal_id=%s reason=%s",
+            source, signal_id, reason,
+        )
+        return
+    # A5 — LLM validation. Opt-in via settings.llm_validation_enabled;
+    # fails OPEN on unreachable/error (caller treats None as "no veto").
+    if settings.llm_validation_enabled:
+        llm_resp = await llm_validator.llm_validate_signal(
+            http,
+            base_url=settings.local_llm_base_url,
+            norm=norm,
+            context=source,
+            timeout_sec=settings.local_llm_timeout_sec,
+        )
+        reject_tags = llm_validator.parse_reject_tags_csv(
+            settings.llm_validation_reject_tags_csv,
+        )
+        reject, llm_reason = llm_validator.should_reject_llm_validation(
+            llm_resp, reject_tags=reject_tags,
+        )
+        if reject:
+            log.info(
+                "signal_pusher.pro_skip_llm source=%s signal_id=%s reason=%s",
+                source, signal_id, llm_reason,
+            )
+            return
     text = format_signal_message(
         norm, brand_name=settings.brand_name, is_pro=True,
+        quality_snapshot=snapshot,
     )
     if settings.telegram_mock_mode:
         log.info("signal_pusher.pro_mock_broadcast signal_id=%s text=%r", signal_id, text[:160])
@@ -344,10 +487,21 @@ async def _try_pro_broadcast(
 async def _flush_free_top_n(
     *, buffer: list[dict[str, Any]], pool: asyncpg.Pool,
     http: httpx.AsyncClient, source: str,
+    redis_client: redis_async.Redis,
 ) -> None:
     """Pick top-N signals/day; broadcast each (deduped via broadcast_logs)
-    after a delay from their evaluated_at_unix."""
+    after a delay from their evaluated_at_unix.
+
+    Halt-aware: skips the entire flush if upstream strategy halted or
+    operator paused publishing for this source.
+    """
     if not buffer:
+        return
+    if await is_source_halted(redis_client, source=source):
+        log.info(
+            "signal_pusher.free_flush_skip_halted source=%s buffered=%d",
+            source, len(buffer),
+        )
         return
     # Filter to ones that have aged past the delay
     now = time.time()
@@ -431,15 +585,23 @@ async def _consume_gmx_paper_log(
                     continue
                 await _try_gmx_pro_plus_broadcast(
                     norm, signal_id=entry_id, pool=pool, http=http,
+                    redis_client=redis_client,
                 )
     log.info("signal_pusher.gmx_loop_stopped")
 
 
 async def _try_gmx_pro_plus_broadcast(
     norm: dict[str, Any], *, signal_id: str, pool: asyncpg.Pool,
-    http: httpx.AsyncClient,
+    http: httpx.AsyncClient, redis_client: redis_async.Redis,
 ) -> None:
-    """Broadcast a GMX whale-liq alert to the Pro+ TG group. Idempotent."""
+    """Broadcast a GMX whale-liq alert to the Pro+ TG group. Idempotent.
+
+    Halt-aware: skips if upstream gmx_liquidator halted or operator
+    paused publishing for 'gmx_liquidation' source.
+    """
+    if await is_source_halted(redis_client, source="gmx_liquidation"):
+        log.info("signal_pusher.gmx_skip_halted signal_id=%s", signal_id)
+        return
     text = format_gmx_alert(norm, brand_name=settings.brand_name)
     if settings.telegram_mock_mode:
         log.info(
@@ -485,8 +647,19 @@ async def run(stop: asyncio.Event) -> None:
         settings.gmx_alerts_min_size_usd,
     )
 
+    # A7 — Sentry init. No-op when DSN empty (dev/test) or sentry-sdk absent.
+    observability.init_sentry(
+        dsn=settings.sentry_dsn,
+        environment=settings.sentry_environment,
+        traces_sample_rate=settings.sentry_traces_sample_rate,
+        component="signal_pusher",
+    )
+
     pool = await asyncpg.create_pool(settings.postgres_dsn, min_size=1, max_size=5)
     redis_client = redis_async.from_url(settings.redis_url, decode_responses=True)
+    tracked_slugs = [
+        s.strip() for s in settings.quality_tracked_slugs.split(",") if s.strip()
+    ]
     async with httpx.AsyncClient() as http:
         try:
             await asyncio.gather(
@@ -495,6 +668,17 @@ async def run(stop: asyncio.Event) -> None:
                 ),
                 _consume_gmx_paper_log(
                     redis_client, pool, http, stop=stop,
+                ),
+                # A4 — periodic quality-snapshot writer. Computes per-slug
+                # Sharpe + PnL + n_closed every quality_snapshot_interval_sec
+                # and writes to publishing:quality:<slug> with EXPIRE.
+                quality_snapshot.writer_loop(
+                    pool, redis_client,
+                    slugs=tracked_slugs,
+                    interval_sec=settings.quality_snapshot_interval_sec,
+                    ttl_sec=settings.quality_snapshot_ttl_sec,
+                    window_days=settings.quality_window_days,
+                    stop=stop,
                 ),
             )
         finally:
@@ -506,9 +690,12 @@ async def run(stop: asyncio.Event) -> None:
 __all__ = [
     "format_gmx_alert",
     "format_signal_message",
+    "is_emitted_signal",
+    "is_source_halted",
     "parse_chainlink_eval",
     "parse_gmx_execution",
     "passes_gmx_alert_gate",
     "run",
     "select_free_top_n",
+    "source_to_strategy_slug",
 ]
