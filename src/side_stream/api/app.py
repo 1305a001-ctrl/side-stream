@@ -117,6 +117,20 @@ app = FastAPI(
 )
 
 
+# ─── Public landing + dashboard + analytics router includes ────────────
+# Each module owns its own APIRouter. Kept as deferred imports because
+# they reference `settings` at module load and we want settings to be
+# fully constructed before any HTML template caches.
+
+from side_stream.api import analytics as _analytics_routes  # noqa: E402
+from side_stream.api import dashboard as _dashboard_routes  # noqa: E402
+from side_stream.api import landing as _landing_routes  # noqa: E402
+
+app.include_router(_landing_routes.router)
+app.include_router(_dashboard_routes.router)
+app.include_router(_analytics_routes.router)
+
+
 # ─── Health ────────────────────────────────────────────────────────────
 
 
