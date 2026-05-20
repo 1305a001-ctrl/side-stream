@@ -94,13 +94,19 @@ python -m side_stream.main
 
 ## Deploy on ai-primary
 
+**Full runbook: [docs/DEPLOY.md](docs/DEPLOY.md)** — pre-flight checklist,
+soup-to-nuts deploy, admin smoke, 24h soak, public launch flip sequence,
+rollback procedures. Use that, not these notes.
+
+Quick reference:
+
 ```bash
 # 1. Build + push image (after committing + pushing to github.com/1305a001-ctrl/side-stream)
 docker build -t ghcr.io/1305a001-ctrl/side-stream:latest .
 docker push ghcr.io/1305a001-ctrl/side-stream:latest
 
 # 2. SSH ai-primary, create env file
-sudo nano /srv/secrets/side-stream.env  # paste all SAAS env vars
+sudo nano /srv/secrets/side-stream.env  # see docs/DEPLOY.md for full template
 sudo chmod 600 /srv/secrets/side-stream.env
 
 # 3. Copy compose + start
